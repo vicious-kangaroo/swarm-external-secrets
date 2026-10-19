@@ -410,26 +410,44 @@ func (d *SecretsDriver) updateDockerSecret(secretName string, newValue []byte) e
 		return fmt.Errorf("failed to list secrets: %v", err)
 	}
 
+	secretIDs, err := d.findReferencedSecretIDs(secretName)
+	if err != nil {
+		return fmt.Errorf("failed to find referenced secret IDs: %v", err)
+	} else if len(secretIDs) == 0 {
+		log.Infof("No service found to use the secret %s", secretName)
+		return nil
+	} else if len(secretIDs) > 1 {
+		log.Warnf("Multiple referenced secret IDs found for secret %s: %v", secretName, secretIDs)
+	} else {
+		log.Infof("Single referenced secret ID found for secret %s: %v", secretName, secretIDs[0])
+	}
+
 	var existingSecret *swarm.Secret
 	for _, secret := range secrets {
-		if secret.Spec.Name == secretName {
+		if secret.ID == secretIDs[0] {
 			existingSecret = &secret
 			break
 		}
 	}
 
 	if existingSecret == nil {
-		return fmt.Errorf("secret %s not found", secretName)
+		// This should not happen as we have already found referenced secret IDs, but the secret might have been removed in the meantime.
+		return fmt.Errorf("secret %s (%s) not found", secretName, secretIDs[0])
 	}
+
+	log.Debugf("Found an existing secret: %s with ID: %s", existingSecret.Spec.Name, existingSecret.ID)
 
 	// Generate a unique name for the new secret version
 	newSecretName := fmt.Sprintf("%s-%d", secretName, time.Now().UnixNano())
 
-	// Create new secret with versioned name and same labels but updated value
+	// Create new secret with versioned name and updated value and labels
+	newLabels := maps.Clone(existingSecret.Spec.Labels)
+	newLabels["original-secret-name"] = secretName
+
 	newSecretSpec := swarm.SecretSpec{
 		Annotations: swarm.Annotations{
 			Name:   newSecretName,
-			Labels: existingSecret.Spec.Labels,
+			Labels: newLabels,
 		},
 		Data: newValue,
 	}
@@ -451,6 +469,8 @@ func (d *SecretsDriver) updateDockerSecret(secretName string, newValue []byte) e
 		return fmt.Errorf("failed to update services to use new secret: %v", err)
 	}
 
+	// TODO: Consider implementing a mechanism to clean up old dangling secrets that are no longer referenced by any service.
+
 	// Remove the old secret only after services are updated
 	if err := d.dockerClient.SecretRemove(ctx, existingSecret.ID); err != nil {
 		log.Warnf("Failed to remove old secret version %s: %v", existingSecret.ID, err)
@@ -458,6 +478,42 @@ func (d *SecretsDriver) updateDockerSecret(secretName string, newValue []byte) e
 	}
 
 	return nil
+}
+
+func (d *SecretsDriver) findReferencedSecretIDs(secretName string) ([]string, error) {
+	// Find all secrets used by services that match the given secret name.
+	// The matching is done by either exact matching or "starts-with" the original secret name.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	services, err := d.dockerClient.ServiceList(ctx, swarm.ServiceListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list services: %v", err)
+	}
+
+	var foundSecretIDs []string
+
+	for _, service := range services {
+		containerSpec := service.Spec.TaskTemplate.ContainerSpec
+		if containerSpec == nil {
+			log.Warnf("Skipping secret lookup for the service %s: TaskTemplate.ContainerSpec is nil", service.Spec.Name)
+			continue
+		}
+
+		for _, secretRef := range containerSpec.Secrets {
+			if secretRef == nil {
+				continue
+			}
+
+			svcSecretName := secretRef.SecretName
+
+			if svcSecretName == secretName || strings.HasPrefix(svcSecretName, secretName) {
+				foundSecretIDs = append(foundSecretIDs, secretRef.SecretID)
+			}
+		}
+	}
+
+	return foundSecretIDs, nil
 }
 
 // updateServicesSecretReference updates all services to use the new secret version
@@ -500,6 +556,8 @@ func (d *SecretsDriver) updateServicesSecretReference(oldSecretName, oldSecretID
 
 	if len(updatedServices) > 0 {
 		log.Infof("Updated services to use new secret %s: %v", newSecretName, updatedServices)
+	} else {
+		log.Infof("No services were updated to use the new secret %s", newSecretName)
 	}
 
 	return nil
